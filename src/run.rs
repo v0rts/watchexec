@@ -13,7 +13,7 @@ use std::{
     io::Write,
     sync::{
         mpsc::{channel, Receiver},
-        Arc, RwLock,
+        Arc, RwLock, atomic::{AtomicBool, Ordering}
     },
     time::Duration,
 };
@@ -94,15 +94,19 @@ where
     });
     let filter = NotificationFilter::new(&args.filters, &args.ignores, gitignore, ignore)?;
 
+    debug!("Preparing notify");
     let (tx, rx) = channel();
     let poll = args.poll;
     #[cfg(target_os = "linux")]
     let poll_interval = args.poll_interval;
     #[allow(clippy::redundant_clone)]
     let watcher = Watcher::new(tx.clone(), &paths, args.poll, args.poll_interval).or_else(|err| {
+        debug!("Preparing notify (polling fallback)");
+
         if poll {
             return Err(err);
         }
+    debug!("A");
 
         #[cfg(target_os = "linux")]
         {
@@ -123,13 +127,17 @@ where
         Err(err)
     })?;
 
+    debug!("Preparing command");
+
     if watcher.is_polling() {
         warn!("Polling for changes every {} ms", args.poll_interval);
     }
 
-    // Call handler initially, if necessary
-    if args.run_initially && !handler.on_manual()? {
-        return Ok(());
+    if args.run_initially {
+        debug!("Call handler initially");
+        if !handler.on_manual()? {
+            return Ok(());
+        }
     }
 
     loop {
@@ -145,8 +153,10 @@ where
     Ok(())
 }
 
+#[derive(Clone)]
 pub struct ExecHandler {
     args: Args,
+    stop: Arc<AtomicBool>,
     signal: Option<Signal>,
     child_process: Arc<RwLock<Option<Process>>>,
 }
@@ -159,27 +169,52 @@ impl ExecHandler {
         // Convert signal string to the corresponding integer
         let signal = signal::new(args.signal.clone());
 
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopper = stop.clone();
+
+        let handler = Self {
+            args,
+            stop,
+            signal,
+            child_process,
+        };
+
         signal::install_handler(move |sig: Signal| {
+            debug!("Handling signal: {:?}", sig);
             if let Some(lock) = weak_child.upgrade() {
                 let strong = lock.read().expect("poisoned lock in install_handler");
                 if let Some(ref child) = *strong {
                     match sig {
                         Signal::SIGCHLD => child.reap(), // SIGCHLD is special, initiate reap()
+                        Signal::SIGTERM | Signal::SIGINT => {
+                            debug!("Setting up exit after child finishes");
+                            stopper.store(true, Ordering::SeqCst);
+                            child.signal(sig)
+                        },
                         _ => child.signal(sig),
+                    }
+                } else {
+                    match sig {
+                        Signal::SIGTERM | Signal::SIGINT => {
+                            debug!("Exiting now");
+                            std::process::exit(0);
+                        },
+                        _ => {}
                     }
                 }
             }
         });
 
-        Ok(Self {
-            args,
-            signal,
-            child_process,
-        })
+        Ok(handler)
+    }
+
+    fn should_stop(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
     }
 
     fn spawn(&self, ops: &[PathOp]) -> Result<()> {
         if self.args.clear_screen {
+            debug!("Clearing screen");
             clear_screen();
         }
 
@@ -193,16 +228,19 @@ impl ExecHandler {
 
 impl Handler for ExecHandler {
     fn args(&self) -> Args {
+        debug!("Handing args over to Handler: {:?}", self.args);
         self.args.clone()
     }
 
     // Only returns Err() on lock poisoning.
     fn on_manual(&self) -> Result<bool> {
         if self.args.once {
-            return Ok(true);
+            debug!("Running on manual (once)");
+        } else {
+            debug!("Running on manual");
+            self.spawn(&[])?;
         }
 
-        self.spawn(&[])?;
         Ok(true)
     }
 
@@ -221,6 +259,7 @@ impl Handler for ExecHandler {
             // Custom restart behaviour (--restart was given, and --signal specified):
             // Send specified signal to the child, wait for it to exit, then run the command again
             (true, true) => {
+                debug!("Custom restart with {:?}", self.signal);
                 signal_process(&self.child_process, self.signal, true);
                 self.spawn(ops)?;
             }
@@ -229,24 +268,30 @@ impl Handler for ExecHandler {
             // Send SIGTERM to the child, wait for it to exit, then run the command again
             (true, false) => {
                 let sigterm = signal::new(Some("SIGTERM".into()));
+                debug!("Default restart with {:?}", sigterm);
                 signal_process(&self.child_process, sigterm, true);
                 self.spawn(ops)?;
             }
 
             // SIGHUP scenario: --signal was given, but --restart was not
             // Just send a signal (e.g. SIGHUP) to the child, do nothing more
-            (false, true) => signal_process(&self.child_process, self.signal, false),
+            (false, true) => {
+                debug!("No restart with {:?}", self.signal);
+                signal_process(&self.child_process, self.signal, false);
+            }
 
             // Default behaviour (neither --signal nor --restart specified):
             // Make sure the previous run was ended, then run the command again
             (false, false) => {
+                debug!("Default behaviour");
                 signal_process(&self.child_process, None, true);
                 self.spawn(ops)?;
             }
         }
 
         // Handle once option for integration testing
-        if self.args.once {
+        if self.args.once || self.should_stop() {
+            debug!("Once {:?} or stopper {:?} with {:?}", self.args.once, self.should_stop(), self.signal);
             signal_process(&self.child_process, self.signal, false);
             return Ok(false);
         }
