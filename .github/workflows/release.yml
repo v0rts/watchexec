@@ -56,7 +56,7 @@ jobs:
             experimental: false
 
           - name: mac-arm64
-            os: macos-11.0
+            os: macos-latest
             target: aarch64-apple-darwin
             cross: true
             experimental: true
@@ -83,18 +83,36 @@ jobs:
         with:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
+
       - uses: actions-rs/toolchain@v1
         with:
           target: ${{ matrix.target }}
           toolchain: stable
           profile: minimal
           override: true
+
+      - uses: goto-bus-stop/setup-zig@v1
+        if: ${{ matrix.target == 'aarch64-apple-darwin' }}
+        with:
+          version: master # 0.8.0
+      - name: zcc wrapper and target config
+        shell: bash
+        if: ${{ matrix.target == 'aarch64-apple-darwin' }}
+        run: |
+          echo '#!/bin/sh' > $HOME/zcc
+          echo 'zig cc -target aarch64-macos $@' >> $HOME/zcc
+          chmod +x $HOME/zcc
+
+          echo '[target.aarch64-apple-darwin]' > $HOME/.cargo/config.toml
+          echo "linker = \"$HOME/zcc\"" >> $HOME/.cargo/config.toml
+
       - uses: actions-rs/cargo@v1
         name: Build
         with:
           use-cross: ${{ matrix.cross }}
           command: build
           args: --package watchexec-cli --release --locked --target ${{ matrix.target }}
+
       - name: Package
         shell: bash
         run: |
@@ -108,6 +126,7 @@ jobs:
           strip "$bin" || true
           mv "$bin" "$dst/"
           mv cli/README.md LICENSE completions doc/watchexec.1{,.html} "$dst/"
+
       - name: Archive (tar)
         if: '! startsWith(matrix.name, ''windows-'')'
         shell: bash
@@ -153,6 +172,7 @@ jobs:
           version=$(grep -oE '[0-9.]+' <<< "${{ github.ref }}")
           dst="watchexec-${version}-${{ matrix.target }}"
           7z a "$dst.zip" "$dst"
+
       - uses: softprops/action-gh-release@v1
         with:
           files: |
