@@ -13,19 +13,22 @@ use watchexec::{
 	paths::common_prefix,
 	project::{self, ProjectType},
 };
-
 pub async fn dirs(args: &ArgMatches<'static>) -> Result<(PathBuf, PathBuf)> {
-	let mut origins = HashSet::new();
-	for path in args.values_of("paths").unwrap_or_default() {
-		let path = canonicalize(path).into_diagnostic()?;
-		origins.extend(project::origins(&path).await);
-	}
+	let project_origin = if let Some(origin) = args.value_of("project-origin") {
+		debug!(?origin, "project origin override");
+		canonicalize(origin).into_diagnostic()?
+	} else {
+		let mut origins = HashSet::new();
+		for path in args.values_of("paths").unwrap_or_default() {
+			let path = canonicalize(path).into_diagnostic()?;
+			origins.extend(project::origins(&path).await);
+		}
 
-	debug!(?origins, "resolved all project origins");
+		debug!(?origins, "resolved all project origins");
 
-	let project_origin =
 		canonicalize(common_prefix(&origins).unwrap_or_else(|| PathBuf::from(".")))
-			.into_diagnostic()?;
+			.into_diagnostic()?
+	};
 	debug!(?project_origin, "resolved common/project origin");
 
 	let workdir = env::current_dir()
