@@ -372,10 +372,12 @@ async fn extensions_and_filters_slash() {
 async fn leading_single_glob_file() {
 	let filterer = filt(&["*/justfile"], &[], &[]).await;
 
-	filterer.file_does_pass("justfile");
 	filterer.file_does_pass("foo/justfile");
 	filterer.file_doesnt_pass("notfile");
 	filterer.file_doesnt_pass("not/thisfile");
+
+	// Watchexec 1.x buggy behaviour, should not pass
+	filterer.file_does_pass("justfile");
 }
 
 #[tokio::test]
